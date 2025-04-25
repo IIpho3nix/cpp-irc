@@ -420,6 +420,13 @@ void client_handler(socket_t client_socket)
                 continue;
             }
 
+            if (user_input == "/ping")
+            {
+                std::string pong_msg = get_timestamp() + "[Server Message] Pong!";
+                send(client_socket, pong_msg.c_str(), pong_msg.size(), 0);
+                continue;
+            }
+
             if (user_input == "/help")
             {
                 std::string help_msg = get_timestamp() + "[Server Message] Commands:\n";
@@ -427,6 +434,7 @@ void client_handler(socket_t client_socket)
                 help_msg += "/me [message] - Sends an action message\n";
                 help_msg += "/nick [username] - Changes your username\n";
                 help_msg += "/msg [username] [message] - Sends a private message\n";
+                help_msg += "/ping - Responds with 'Pong!'\n";
                 help_msg += "/help - Display this help message\n";
                 send(client_socket, help_msg.c_str(), help_msg.size(), 0);
                 continue;
