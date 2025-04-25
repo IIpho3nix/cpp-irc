@@ -1,0 +1,6 @@
+.vscode
+config.env
+server
+server.exe
+log.json
+.DS_store
