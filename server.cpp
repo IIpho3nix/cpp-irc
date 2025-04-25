@@ -422,7 +422,7 @@ void client_handler(socket_t client_socket)
 
             if (user_input == "/ping")
             {
-                std::string pong_msg = get_timestamp() + "[Server Message] Pong!";
+                std::string pong_msg = get_timestamp() + "[Server Message] Pong!\n";
                 send(client_socket, pong_msg.c_str(), pong_msg.size(), 0);
                 continue;
             }
