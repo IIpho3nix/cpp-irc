@@ -31,12 +31,75 @@ typedef int socket_t;
 
 std::mutex clients_mutex;
 std::vector<socket_t> clients;
-std::mutex chatlog_mutex;
-std::vector<std::string> chat_log;
 std::map<std::string, socket_t> sockets;
 std::mutex sockets_mutex;
+std::vector<unsigned char> xorKey;
+std::string server_auth_secret;
 
 std::map<std::string, std::any> config;
+
+std::vector<unsigned char> load_xor_key(const std::string &filepath)
+{
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file)
+    {
+        throw std::runtime_error("Failed to open XOR key file: " + filepath);
+    }
+
+    std::vector<unsigned char> key(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+
+    if (key.empty())
+    {
+        throw std::runtime_error("XOR key file is empty: " + filepath);
+    }
+
+    return key;
+}
+
+void xorEncryptDecrypt(std::string &data, const std::vector<unsigned char> &key)
+{
+    for (size_t i = 0; i < data.size(); ++i)
+    {
+        data[i] ^= key[i % key.size()];
+    }
+}
+
+bool xor_send(socket_t client_socket, const std::string &message, const std::vector<unsigned char> &key)
+{
+    std::string encrypted = message;
+    xorEncryptDecrypt(encrypted, key);
+
+    auto sent = send(client_socket, encrypted.c_str(), encrypted.size(), 0);
+    return sent == encrypted.size();
+}
+
+std::string xor_recv(socket_t client_socket, const std::vector<unsigned char> &key)
+{
+    char buffer[2048] = {0};
+    int bytes_received = recv(client_socket, buffer, sizeof(buffer), 0);
+    if (bytes_received <= 0)
+    {
+        throw std::runtime_error("Failed to receive data");
+        return "";
+    }
+
+    std::string decrypted(buffer, bytes_received);
+    xorEncryptDecrypt(decrypted, key);
+    return decrypted;
+}
+
+bool xorDecrypt(std::vector<unsigned char> &data, const std::vector<unsigned char> &key)
+{
+    if (key.empty())
+        return false;
+    for (size_t i = 0; i < data.size(); ++i)
+    {
+        data[i] ^= key[i % key.size()];
+    }
+    return true;
+}
 
 void load_config(const std::string &filename = "config.env")
 {
@@ -74,34 +137,6 @@ void load_config(const std::string &filename = "config.env")
     }
 }
 
-void load_chatlog()
-{
-    std::ifstream chatlog_file(std::any_cast<std::string>(config["chatlog_path"]));
-    if (!chatlog_file.is_open())
-    {
-        return;
-    }
-    std::string entry;
-    while (std::getline(chatlog_file, entry))
-    {
-        chat_log.push_back(entry);
-    }
-}
-
-void save_chatlog()
-{
-    std::ofstream chatlog_file(std::any_cast<std::string>(config["chatlog_path"]));
-    if (!chatlog_file.is_open())
-    {
-        std::cerr << "Failed to open " << std::any_cast<std::string>(config["chatlog_path"]) << " for writing" << std::endl;
-        return;
-    }
-    for (const auto &msg : chat_log)
-    {
-        chatlog_file << msg << "\n";
-    }
-}
-
 bool containsControlSequences(const std::string &str)
 {
     for (char c : str)
@@ -121,7 +156,7 @@ void broadcast_message(const std::string &message)
         std::lock_guard<std::mutex> lock(clients_mutex);
         for (socket_t client : clients)
         {
-            send(client, message.c_str(), message.size(), 0);
+            xor_send(client, message, xorKey);
         }
         std::cout << message;
     }
@@ -150,31 +185,37 @@ std::string get_timestamp()
     return oss.str();
 }
 
-bool authenticate(socket_t client_socket)
+bool authenticate(socket_t client_socket, const std::vector<unsigned char> &xorKey)
 {
     try
     {
         char buffer[1024] = {0};
-        std::string prompt = "Enter server password: ";
-        send(client_socket, prompt.c_str(), prompt.size(), 0);
-
         int bytes_received = recv(client_socket, buffer, 1024, 0);
         if (bytes_received <= 0)
         {
-            throw std::runtime_error("Failed to receive password");
+            throw std::runtime_error("Failed to receive auth token");
+            return false;
         }
 
-        std::string password(buffer, bytes_received);
-        password.erase(password.find_last_not_of(" \r\n") + 1);
+        std::vector<unsigned char> encrypted(buffer, buffer + bytes_received);
+        xorDecrypt(encrypted, xorKey);
+        std::string message(encrypted.begin(), encrypted.end());
+        message.erase(message.find_last_not_of(" \r\n") + 1);
 
-        if (password == std::any_cast<std::string>(config["server_password"]))
+        if (message == server_auth_secret)
         {
-            send(client_socket, "Password accepted\n", 18, 0);
+            std::string reply = "accepted";
+            for (size_t i = 0; i < reply.size(); ++i)
+                reply[i] ^= xorKey[i % xorKey.size()];
+            send(client_socket, reply.c_str(), reply.size(), 0);
             return true;
         }
         else
         {
-            send(client_socket, "Incorrect password\n", 19, 0);
+            std::string reply = "denied";
+            for (size_t i = 0; i < reply.size(); ++i)
+                reply[i] ^= xorKey[i % xorKey.size()];
+            send(client_socket, reply.c_str(), reply.size(), 0);
             return false;
         }
     }
@@ -189,20 +230,18 @@ bool handle_username(socket_t client_socket, std::string &username)
 {
     try
     {
-        char buffer[1024] = {0};
-        send(client_socket, "Enter username: ", 16, 0);
-        recv(client_socket, buffer, 1024, 0);
-        username = std::string(buffer);
+        xor_send(client_socket, "Enter username: ", xorKey);
+        username = xor_recv(client_socket, xorKey).c_str();
         auto pos = username.find('\n');
         if (pos != std::string::npos)
             username.erase(pos);
-        
+
         pos = username.find('\r');
         if (pos != std::string::npos)
             username.erase(pos);
-        
+
         std::replace(username.begin(), username.end(), ' ', '_');
-        send(client_socket, "Username accepted.\n", 19, 0);
+        xor_send(client_socket, "Username accepted.\n", xorKey);
         return true;
     }
     catch (const std::exception &e)
@@ -216,7 +255,7 @@ void client_handler(socket_t client_socket)
 {
     try
     {
-        if (!authenticate(client_socket))
+        if (!authenticate(client_socket, xorKey))
         {
 #ifdef _WIN32
             closesocket(client_socket);
@@ -246,14 +285,6 @@ void client_handler(socket_t client_socket)
         setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
         {
-            std::lock_guard<std::mutex> lock(chatlog_mutex);
-            for (const auto &msg : chat_log)
-            {
-                send(client_socket, (msg + "\n").c_str(), msg.size() + 1, 0);
-            }
-        }
-
-        {
             std::lock_guard<std::mutex> lock(clients_mutex);
             clients.push_back(client_socket);
         }
@@ -266,32 +297,12 @@ void client_handler(socket_t client_socket)
         std::string login_msg = get_timestamp() + "[Server Message] <" + username + "> logged in from " + std::string(client_ip);
         broadcast_message(login_msg + "\n");
 
-        {
-            std::lock_guard<std::mutex> lock(chatlog_mutex);
-            chat_log.push_back(login_msg);
-            save_chatlog();
-        }
-
         std::string welcome_msg = get_timestamp() + "[Server Message] Welcome to " + std::any_cast<std::string>(config["server_name"]) + ", " + username + "! type /quit to quit, type /help for commands.";
         broadcast_message(welcome_msg + "\n");
 
-        {
-            std::lock_guard<std::mutex> lock(chatlog_mutex);
-            chat_log.push_back(welcome_msg);
-            save_chatlog();
-        }
-
-        char buffer[1024];
         while (true)
         {
-            memset(buffer, 0, sizeof(buffer));
-            int valread = recv(client_socket, buffer, 1024, 0);
-            if (valread <= 0)
-            {
-                continue;
-            }
-
-            std::string user_input(buffer);
+            std::string user_input = xor_recv(client_socket, xorKey);
             user_input.erase(user_input.find_last_not_of(" \n\r") + 1);
 
             if (user_input.empty())
@@ -318,12 +329,6 @@ void client_handler(socket_t client_socket)
 
                 std::string exit_msg = get_timestamp() + "[Server Message] <" + username + "> has disconnected. (" + reason + ")";
                 broadcast_message(exit_msg + "\n");
-
-                {
-                    std::lock_guard<std::mutex> lock(chatlog_mutex);
-                    chat_log.push_back(exit_msg);
-                    save_chatlog();
-                }
 
 #ifdef _WIN32
                 closesocket(client_socket);
@@ -352,12 +357,6 @@ void client_handler(socket_t client_socket)
                 std::string me_msg = get_timestamp() + username + " " + user_input.substr(4);
                 broadcast_message(me_msg + "\n");
 
-                {
-                    std::lock_guard<std::mutex> lock(chatlog_mutex);
-                    chat_log.push_back(me_msg);
-                    save_chatlog();
-                }
-
                 continue;
             }
 
@@ -377,12 +376,6 @@ void client_handler(socket_t client_socket)
                 }
 
                 username = new_username;
-
-                {
-                    std::lock_guard<std::mutex> lock(chatlog_mutex);
-                    chat_log.push_back(nick_msg);
-                    save_chatlog();
-                }
 
                 broadcast_message(nick_msg + "\n");
                 continue;
@@ -410,14 +403,8 @@ void client_handler(socket_t client_socket)
                     {
                         std::string message = get_timestamp() + "[Private Message] <" + username + "> -> <" + target_username + ">: " + args;
                         std::string sendmsg = message + "\n";
-                        send(target_socket->second, sendmsg.c_str(), sendmsg.size(), 0);
-                        send(client_socket, sendmsg.c_str(), sendmsg.size(), 0);
-
-                        {
-                            std::lock_guard<std::mutex> lock(chatlog_mutex);
-                            chat_log.push_back(message);
-                            save_chatlog();
-                        }
+                        xor_send(target_socket->second, sendmsg, xorKey);
+                        xor_send(client_socket, sendmsg, xorKey);
 
                         std::cout << message << std::endl;
                     }
@@ -429,7 +416,7 @@ void client_handler(socket_t client_socket)
             if (user_input == "/ping")
             {
                 std::string pong_msg = get_timestamp() + "[Server Message] Pong!\n";
-                send(client_socket, pong_msg.c_str(), pong_msg.size(), 0);
+                xor_send(client_socket, pong_msg, xorKey);
                 continue;
             }
 
@@ -442,17 +429,11 @@ void client_handler(socket_t client_socket)
                 help_msg += "/msg [username] [message] - Sends a private message\n";
                 help_msg += "/ping - Responds with 'Pong!'\n";
                 help_msg += "/help - Display this help message\n";
-                send(client_socket, help_msg.c_str(), help_msg.size(), 0);
+                xor_send(client_socket, help_msg, xorKey);
                 continue;
             }
 
             std::string message = get_timestamp() + "<" + username + ">: " + user_input;
-
-            {
-                std::lock_guard<std::mutex> lock(chatlog_mutex);
-                chat_log.push_back(message);
-                save_chatlog();
-            }
 
             broadcast_message(message + "\n");
         }
@@ -460,6 +441,7 @@ void client_handler(socket_t client_socket)
     catch (const std::exception &e)
     {
         std::cerr << "Error in client handler: " << e.what() << std::endl;
+        return;
     }
     finally:
     {
@@ -496,12 +478,6 @@ void client_handler(socket_t client_socket)
         {
             std::string exit_msg = get_timestamp() + "[Server Message] <" + username + "> has disconnected. (Connection closed)";
 
-            {
-                std::lock_guard<std::mutex> lock(chatlog_mutex);
-                chat_log.push_back(exit_msg);
-                save_chatlog();
-            }
-
             broadcast_message(exit_msg + "\n");
         }
     }
@@ -532,24 +508,23 @@ int main(int argc, char *argv[])
 
         if (args.find("--server_name") == args.end() ||
             args.find("--port") == args.end() ||
-            args.find("--server_password") == args.end() ||
-            args.find("--chatlog_path") == args.end())
+            args.find("--keyfile") == args.end())
         {
             std::cerr << "Missing required arguments.\n";
             std::cerr << "Usage:\n";
             std::cerr << "  " << argv[0] << " --config <config_file>\n";
             std::cerr << "OR\n";
-            std::cerr << "  " << argv[0] << " --server_name <name> --port <port> --server_password <password> --chatlog_path <path>\n";
+            std::cerr << "  " << argv[0] << " --server_name <name> --port <port> --keyfile <keyfile>\n";
             return 1;
         }
 
         config["server_name"] = args["--server_name"];
         config["port"] = std::stoi(args["--port"]);
-        config["server_password"] = args["--server_password"];
-        config["chatlog_path"] = args["--chatlog_path"];
+        config["keyfile"] = args["--keyfile"];
     }
 
-    load_chatlog();
+    xorKey = load_xor_key(std::any_cast<std::string>(config["keyfile"]));
+    server_auth_secret = std::string(xorKey.end() - 16, xorKey.end());
 
     socket_t server_fd, new_socket;
     struct sockaddr_in address;
