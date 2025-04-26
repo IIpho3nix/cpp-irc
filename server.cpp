@@ -193,8 +193,14 @@ bool handle_username(socket_t client_socket, std::string &username)
         send(client_socket, "Enter username: ", 16, 0);
         recv(client_socket, buffer, 1024, 0);
         username = std::string(buffer);
-        username.erase(username.find("\n"));
-        username.erase(username.find("\r"));
+        auto pos = username.find('\n');
+        if (pos != std::string::npos)
+            username.erase(pos);
+        
+        pos = username.find('\r');
+        if (pos != std::string::npos)
+            username.erase(pos);
+        
         std::replace(username.begin(), username.end(), ' ', '_');
         send(client_socket, "Username accepted.\n", 19, 0);
         return true;
